@@ -25,7 +25,7 @@ def main() -> int:
         query = sys.argv[1]
         message = fault_code_message_for(query)
         if not message:
-            print(f"(empty input)")
+            print("(empty input)")
             return 0
         print(f"{query}\t{message}")
         return 0

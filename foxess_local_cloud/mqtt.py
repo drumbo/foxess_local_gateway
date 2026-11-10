@@ -195,6 +195,16 @@ class MqttPublisher:
             self.emit("mqtt_command_handler_error", topic=topic, error=str(exc))
 
     def close(self) -> None:
+        # A clean disconnect suppresses the Last Will, so state "offline"
+        # explicitly before tearing the client down.
+        if self.enabled and self.client is not None and self._mqtt_connected:
+            try:
+                info = self.client.publish(f"{self.config.topic_prefix}/status", "offline", retain=True)
+                wait = getattr(info, "wait_for_publish", None)
+                if callable(wait):
+                    wait(timeout=2)
+            except Exception as exc:
+                self.emit("mqtt_close_error", error=str(exc))
         self._teardown_client()
 
     def active_power_limit_command_topic(self, serial: str) -> str:

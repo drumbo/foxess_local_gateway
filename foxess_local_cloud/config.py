@@ -70,6 +70,15 @@ class FirmwareCaptureConfig:
 
 
 @dataclass(frozen=True)
+class RelayConfig:
+    enabled: bool = False
+    upstreams: dict[str, tuple[str, int]] = field(default_factory=dict)
+    fallback_to_original_destination: bool = True
+    connect_timeout_seconds: float = 10.0
+    skip_cert_verify: bool = False
+
+
+@dataclass(frozen=True)
 class AppConfig:
     host: str = "0.0.0.0"
     port: int = 14431
@@ -85,21 +94,12 @@ class AppConfig:
     # ActivePowerLimit retry-on-reconnect kicks in. 0 disables. Linux-only knobs;
     # silently skipped where unsupported.
     inverter_tcp_keepalive_seconds: int = 30
-    relay: RelayConfig = field(default_factory=lambda: RelayConfig())
+    relay: RelayConfig = field(default_factory=RelayConfig)
     inverter_control: InverterControl = field(default_factory=InverterControl)
     firmware_capture: FirmwareCaptureConfig = field(default_factory=FirmwareCaptureConfig)
     # Root/local maintenance interface used only by the separate firmware CLI.
     # None disables it (the default for library/test configurations).
     firmware_control_socket: Path | None = None
-
-
-@dataclass(frozen=True)
-class RelayConfig:
-    enabled: bool = False
-    upstreams: dict[str, tuple[str, int]] = field(default_factory=dict)
-    fallback_to_original_destination: bool = True
-    connect_timeout_seconds: float = 10.0
-    skip_cert_verify: bool = False
 
 
 def _load_raw(path: Path) -> dict[str, Any]:
@@ -127,9 +127,11 @@ def load_config(path: Path | None) -> AppConfig:
     capture_raw = raw.get("firmware_capture", {}) or {}
     upstreams: dict[str, tuple[str, int]] = {}
     for original, target in (relay_raw.get("upstreams", {}) or {}).items():
-        host, port = str(target).rsplit(":", 1)
+        host, sep, port = str(target).rpartition(":")
+        if not sep or not host or not port.isdigit():
+            raise ConfigError(f"relay.upstreams[{original!r}] must be 'host:port', got {target!r}")
         upstreams[str(original)] = (host, int(port))
-    return AppConfig(
+    config = AppConfig(
         host=raw.get("host", "0.0.0.0"),
         port=int(raw.get("port", 14431)),
         cert=Path(raw.get("cert", "runtime/foxess-local-cloud-cert.pem")),
@@ -178,6 +180,44 @@ def load_config(path: Path | None) -> AppConfig:
             else None
         ),
     )
+    validate_config(config)
+    return config
+
+
+class ConfigError(ValueError):
+    """Raised when the configuration file contains an invalid value."""
+
+
+def validate_config(config: AppConfig) -> None:
+    """Fail fast with a readable message instead of an obscure runtime error."""
+    problems: list[str] = []
+
+    def check(ok: bool, message: str) -> None:
+        if not ok:
+            problems.append(message)
+
+    check(0 < config.port < 65536, f"port must be 1-65535, got {config.port}")
+    check(0 < config.mqtt.port < 65536, f"mqtt.port must be 1-65535, got {config.mqtt.port}")
+    check(config.publish_min_interval_seconds >= 0, "publish_min_interval_seconds must be >= 0")
+    check(config.inverter_tcp_keepalive_seconds >= 0, "inverter_tcp_keepalive_seconds must be >= 0")
+    check(config.mqtt.keepalive_seconds > 0, "mqtt.keepalive_seconds must be > 0")
+    check(config.mqtt.reconnect_max_delay_seconds > 0, "mqtt.reconnect_max_delay_seconds must be > 0")
+    check(config.mqtt.health_check_interval_seconds >= 0, "mqtt.health_check_interval_seconds must be >= 0")
+    check(config.mqtt.telemetry_stale_after_seconds >= 0, "mqtt.telemetry_stale_after_seconds must be >= 0")
+    check(
+        config.mqtt.expire_after_seconds is None or config.mqtt.expire_after_seconds > 0,
+        "mqtt.expire_after_seconds must be null or > 0",
+    )
+    check(
+        0 <= config.inverter_control.active_power_limit_address <= 0xFFFF,
+        "inverter_control.active_power_limit_address must be 0-65535",
+    )
+    check(config.inverter_control.write_timeout_seconds >= 0, "inverter_control.write_timeout_seconds must be >= 0")
+    check(config.relay.connect_timeout_seconds > 0, "relay.connect_timeout_seconds must be > 0")
+    for original, (_host, port) in config.relay.upstreams.items():
+        check(0 < port < 65536, f"relay.upstreams[{original!r}] port must be 1-65535")
+    if problems:
+        raise ConfigError("invalid configuration: " + "; ".join(problems))
 
 
 def optional_int(value: Any) -> int | None:

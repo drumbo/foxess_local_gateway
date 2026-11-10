@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import ipaddress
 import json
-import os
 import re
-import socket
 import ssl
-import struct
+import sys
 import time
 from pathlib import Path
 from typing import Any, TextIO
@@ -20,12 +16,23 @@ from .config import AppConfig
 from .firmware import FirmwareCapture, FirmwareImage, FirmwareProtocolError, FirmwareUploader
 from .local_control import LocalControl, WRITE_CONFIRMED, normalize_device
 from .mqtt import MqttPublisher
+from .netutil import (
+    FOXESS_UPSTREAM_CERT_SHA256,
+    apply_inverter_keepalive,
+    check_upstream_cert,
+    drain_with_timeout,
+    expected_disconnect_reason,
+    is_public_ipv4,
+    notify_systemd,
+    original_destination_ip,
+    systemd_watchdog_interval_seconds,
+    upstream_ssl_context,
+)
 from .protocol import (
     BootstrapResponder,
     Frame,
     ascii_text,
     extract_frames,
-    build_modbus_write_single,
     is_mesh_follower_frame,
     is_mesh_root_frame,
     is_modbus_command,
@@ -44,16 +51,10 @@ from .protocol import (
     product_info,
     registration_serial,
 )
-from .telemetry import decode_telemetry, fault_code_for, is_known_fault_code, nonzero_u16_words, supports_ac_fault_history
+from .telemetry import u16, decode_telemetry, fault_code_for, is_known_fault_code, nonzero_u16_words, supports_ac_fault_history
 
 
 FOXESS_CIPHERS = "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384"
-# Pinned SHA-256 fingerprint of the FoxESS Cloud TLS cert (self-signed,
-# valid until 2124, identical across the known upstream IPs as of 2026).
-# Used to detect MITM on the upstream relay leg, since the FoxESS PKI is
-# self-signed and standard CA validation cannot apply. If FoxESS rotates,
-# update this constant or set relay.skip_cert_verify=true in config.
-FOXESS_UPSTREAM_CERT_SHA256 = "0ff6d2d0b548f0a03dced31ce7621a8c9497bdc074d723bc152094e4d299c1b7"
 ACTIVE_POWER_LIMIT_MIN_FIRMWARE = (1, 80)
 ACTIVE_POWER_LIMIT_MIN_FIRMWARE_TEXT = "1.80"
 
@@ -63,61 +64,6 @@ _MODBUS_NAMES = {
     0x06: "write_single",
     0x10: "write_multiple",
 }
-
-_EXPECTED_TLS_DISCONNECT_ERRORS = (
-    "application data after close notify",
-    "eof occurred in violation of protocol",
-    "ssl shutdown timed out",
-)
-
-
-def systemd_watchdog_interval_seconds(environ: dict[str, str] | None = None) -> float | None:
-    """Return a safe systemd watchdog heartbeat interval, if enabled.
-
-    systemd supplies ``WATCHDOG_USEC`` only when WatchdogSec is configured for
-    this service. Respect WATCHDOG_PID so a stale inherited environment cannot
-    accidentally notify for a different process.
-    """
-    env = os.environ if environ is None else environ
-    watchdog_pid = env.get("WATCHDOG_PID")
-    if watchdog_pid and watchdog_pid != str(os.getpid()):
-        return None
-    try:
-        timeout_seconds = int(env.get("WATCHDOG_USEC", "0")) / 1_000_000
-    except ValueError:
-        return None
-    if timeout_seconds <= 0:
-        return None
-    # Notify at least twice per systemd timeout, without needlessly waking the
-    # Pi more often than every 30 seconds for a long timeout.
-    return min(timeout_seconds / 2, 30.0)
-
-
-def notify_systemd(message: str, environ: dict[str, str] | None = None) -> bool:
-    """Send a notification datagram to systemd when NOTIFY_SOCKET is set."""
-    env = os.environ if environ is None else environ
-    path = env.get("NOTIFY_SOCKET")
-    if not path:
-        return False
-    address = "\0" + path[1:] if path.startswith("@") else path
-    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify_socket:
-        notify_socket.connect(address)
-        notify_socket.sendall(message.encode("ascii"))
-    return True
-
-
-def expected_disconnect_reason(exc: BaseException) -> str | None:
-    message = str(exc).lower()
-    if isinstance(exc, TimeoutError) and "ssl shutdown timed out" in message:
-        return "ssl_shutdown_timeout"
-    if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
-        return "connection_lost"
-    if isinstance(exc, ssl.SSLError) and any(
-        expected in message for expected in _EXPECTED_TLS_DISCONNECT_ERRORS
-    ):
-        return "tls_connection_lost"
-    return None
-
 
 def supports_active_power_limit(model: str, firmware: str) -> bool:
     """Whether a reported inverter supports the validated 0xCA5A control path.
@@ -136,6 +82,10 @@ def supports_active_power_limit(model: str, firmware: str) -> bool:
 
 
 class JsonLogger:
+    # Stream for the console copy of each event; None means ``sys.stdout`` at
+    # emit time. Tests set this to a null stream to keep output readable.
+    console_stream: TextIO | None = None
+
     def __init__(self, path: Path | None = None) -> None:
         if path:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -144,7 +94,7 @@ class JsonLogger:
     def emit(self, event: str, **fields: Any) -> None:
         record = {"ts": time.time(), "event": event, **fields}
         line = json.dumps(record, sort_keys=True, separators=(",", ":"))
-        print(line, flush=True)
+        print(line, file=self.console_stream or sys.stdout, flush=True)
         if self.file:
             self.file.write(line + "\n")
             self.file.flush()
@@ -183,6 +133,21 @@ class FoxessLocalCloud:
         self._active_power_limit_gen: dict[str, int] = {}
         self._active_power_limit_confirmed_gen: dict[str, int] = {}
         self.sessions_by_serial: dict[str, Session] = {}
+        self._background: set[asyncio.Task[Any]] = set()
+
+    def spawn(self, coro: Any, name: str) -> asyncio.Task[Any]:
+        """Run a fire-and-forget coroutine while keeping a strong reference
+        (the loop only holds weak ones) and logging any exception."""
+        task = asyncio.create_task(coro, name=name)
+        self._background.add(task)
+
+        def _done(finished: asyncio.Task[Any]) -> None:
+            self._background.discard(finished)
+            if not finished.cancelled() and finished.exception() is not None:
+                self.logger.emit("background_task_error", task=name, error=str(finished.exception()))
+
+        task.add_done_callback(_done)
+        return task
 
     def set_desired_active_power_limit(self, serial: str, percent: int) -> int:
         """Record a new desired setpoint and return its command generation."""
@@ -569,7 +534,7 @@ class Session:
         ):
             return
         self._inverter_control_settle_scheduled = True
-        asyncio.create_task(self._settle_inverter_control())
+        self.app.spawn(self._settle_inverter_control(), "settle_inverter_control")
 
     async def _handle_active_power_limit_setpoint(self, percent: int) -> None:
         if self.local_control is None or not self.serial:
@@ -685,13 +650,14 @@ class Session:
             return
         key = normalize_device(device)
         timeout = self.app.config.inverter_control.write_timeout_seconds
-        asyncio.create_task(
+        self.app.spawn(
             self._active_power_limit_readback_timeout(
                 key,
                 requested_value=expected_value,
                 source=source,
                 timeout=timeout if timeout > 0 else 3.0,
-            )
+            ),
+            "active_power_limit_readback_timeout",
         )
 
     async def _active_power_limit_readback_timeout(
@@ -782,7 +748,7 @@ class Session:
                 asyncio.open_connection(
                     upstream_host,
                     upstream_port,
-                    ssl=ssl._create_unverified_context(),
+                    ssl=upstream_ssl_context(),
                     server_hostname=original_ip or upstream_host,
                 ),
                 timeout=self.app.config.relay.connect_timeout_seconds,
@@ -818,10 +784,21 @@ class Session:
         self.inverter_writer = writer
         if self.local_control is not None:
             self.local_control.attach_inverter_writer(writer)
-        await asyncio.gather(
-            self.relay_client_to_upstream(reader, upstream_writer),
-            self.relay_upstream_to_client(upstream_reader, writer, upstream_writer),
-        )
+        legs = [
+            asyncio.ensure_future(self.relay_client_to_upstream(reader, upstream_writer)),
+            asyncio.ensure_future(self.relay_upstream_to_client(upstream_reader, writer, upstream_writer)),
+        ]
+        try:
+            # When either leg ends (EOF, error, drain timeout) tear down the
+            # other too, so a dead cloud socket cannot leave the session hung.
+            await asyncio.wait(legs, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for leg in legs:
+                leg.cancel()
+            results = await asyncio.gather(*legs, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                raise result
 
     def choose_upstream(self, original_ip: str | None) -> tuple[str, int] | None:
         upstreams = self.app.config.relay.upstreams
@@ -874,7 +851,7 @@ class Session:
                             )
                 if forward:
                     upstream_writer.write(bytes(forward))
-                    await upstream_writer.drain()
+                    await drain_with_timeout(upstream_writer)
         finally:
             upstream_writer.close()
 
@@ -913,7 +890,7 @@ class Session:
                             del forward[idx:idx + len(frame.raw)]
                 if forward:
                     writer.write(bytes(forward))
-                    await writer.drain()
+                    await drain_with_timeout(writer)
         finally:
             writer.close()
 
@@ -1152,7 +1129,6 @@ class Session:
             return await uploader.upload(writer, image, protocol=protocol)
 
     def _update_fault_state(self, payload: bytes) -> None:
-        from .telemetry import u16
         if not supports_ac_fault_history(self.model):
             self._previous_fault_active = False
             return
@@ -1187,68 +1163,3 @@ class Session:
 
 def _iso8601(ts: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
-
-
-def apply_inverter_keepalive(writer: asyncio.StreamWriter, idle_seconds: int) -> None:
-    """Enable TCP keepalive on the inverter connection so a marginal Wi-Fi link
-    is kept warm and a dropped session is detected within ~a minute (feeding the
-    ActivePowerLimit retry-on-reconnect). ``idle_seconds <= 0`` disables it. The
-    per-idle/-interval/-count knobs are Linux-only; missing ones are skipped, so
-    this is a safe no-op on platforms (or sockets) that don't support them."""
-    if idle_seconds <= 0:
-        return
-    sock = writer.get_extra_info("socket")
-    if sock is None or not hasattr(sock, "setsockopt"):
-        return
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        tunables = (
-            ("TCP_KEEPIDLE", idle_seconds),
-            ("TCP_KEEPINTVL", min(idle_seconds, 10)),
-            ("TCP_KEEPCNT", 3),
-        )
-        for name, value in tunables:
-            opt = getattr(socket, name, None)
-            if opt is not None:
-                sock.setsockopt(socket.IPPROTO_TCP, opt, value)
-    except OSError:
-        pass
-
-
-def original_destination_ip(writer: asyncio.StreamWriter) -> str | None:
-    """Best-effort Linux SO_ORIGINAL_DST lookup for redirected IPv4 sockets."""
-
-    sock = writer.get_extra_info("socket")
-    if sock is None:
-        return None
-    try:
-        data = sock.getsockopt(socket.SOL_IP, 80, 16)
-    except OSError:
-        return None
-    if len(data) < 8:
-        return None
-    _family, _port, raw_addr = struct.unpack_from("!HH4s", data)
-    return socket.inet_ntoa(raw_addr)
-
-
-def check_upstream_cert(writer: asyncio.StreamWriter) -> str | None:
-    """Return the peer cert's SHA-256 if it does not match the pinned FoxESS fingerprint."""
-
-    ssl_object = writer.get_extra_info("ssl_object")
-    if ssl_object is None:
-        return "no_ssl_object"
-    der = ssl_object.getpeercert(binary_form=True)
-    if not der:
-        return "no_peer_cert"
-    actual = hashlib.sha256(der).hexdigest()
-    if actual.lower() == FOXESS_UPSTREAM_CERT_SHA256.lower():
-        return None
-    return actual
-
-
-def is_public_ipv4(value: str) -> bool:
-    try:
-        address = ipaddress.ip_address(value)
-    except ValueError:
-        return False
-    return address.version == 4 and address.is_global

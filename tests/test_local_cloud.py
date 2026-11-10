@@ -5,6 +5,7 @@ import os
 import socket
 import subprocess
 import tempfile
+from typing import Any
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -490,7 +491,7 @@ class LocalCloudProtocolTest(unittest.TestCase):
 
         original_pin = FOXESS_UPSTREAM_CERT_SHA256
         try:
-            import foxess_local_cloud.server as server_module
+            import foxess_local_cloud.netutil as server_module
 
             server_module.FOXESS_UPSTREAM_CERT_SHA256 = expected_hex
             self.assertIsNone(check_upstream_cert(FakeWriter()))  # type: ignore[arg-type]
@@ -1478,7 +1479,7 @@ class LocalCloudServerTest(unittest.IsolatedAsyncioTestCase):
         writer = FakeStreamWriter()
         session.local_control.attach_inverter_writer(writer)  # type: ignore[union-attr]
 
-        for requested, actual, expected_result in ((50, 50, "matched"), (40, 75, "mismatch")):
+        for requested, actual, _expected_result in ((50, 50, "matched"), (40, 75, "mismatch")):
             await session._read_active_power_limit_once(expected_value=requested, source="setpoint")
             request = extract_frames(bytearray(writer.writes[-1]))[0]
             echoed = bytes([request.device[0] | 0x80]) + bytes(request.device[1:])
@@ -1611,7 +1612,7 @@ class LocalCloudServerTest(unittest.IsolatedAsyncioTestCase):
     async def test_local_control_read_holding_registers_pending_for_response_join(self) -> None:
         from foxess_local_cloud.config import InverterControl
         from foxess_local_cloud.local_control import normalize_device
-        from foxess_local_cloud.protocol import build_modbus_read_holding, extract_frames, make_frame
+        from foxess_local_cloud.protocol import extract_frames, make_frame
 
         app = FoxessLocalCloud(AppConfig(inverter_control=InverterControl(enabled=True)))
         events: list[tuple[str, dict[str, object]]] = []
@@ -1650,7 +1651,7 @@ class LocalCloudServerTest(unittest.IsolatedAsyncioTestCase):
     async def test_relay_strips_injected_responses_from_upstream_forward(self) -> None:
         from foxess_local_cloud.config import InverterControl
         from foxess_local_cloud.local_control import normalize_device
-        from foxess_local_cloud.protocol import extract_frames, make_frame
+        from foxess_local_cloud.protocol import make_frame
 
         app = FoxessLocalCloud(AppConfig(inverter_control=InverterControl(enabled=True)))
         events: list[tuple[str, dict[str, object]]] = []
@@ -1682,8 +1683,6 @@ class LocalCloudServerTest(unittest.IsolatedAsyncioTestCase):
                 if not self._chunks:
                     return b""
                 return self._chunks.pop(0)
-
-        upstream_writer = FakeStreamWriter()
 
         class ClosableUpstream(FakeStreamWriter):
             def close(self) -> None:
@@ -1790,7 +1789,7 @@ class LocalCloudServerTest(unittest.IsolatedAsyncioTestCase):
 
         topic = publisher.active_power_limit_command_topic(TEST_SERIAL)
 
-        for payload, reason in (
+        for payload, _reason in (
             (b"not-a-number", "not_int"),
             (b"-1", "out_of_range"),
             (b"101", "out_of_range"),
@@ -1856,8 +1855,7 @@ class LocalCloudServerTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_publishes_active_power_limit_state_on_read_response(self) -> None:
         from foxess_local_cloud.config import InverterControl
-        from foxess_local_cloud.local_control import normalize_device
-        from foxess_local_cloud.protocol import build_modbus_read_holding, extract_frames, make_frame
+        from foxess_local_cloud.protocol import extract_frames, make_frame
 
         client = FakeMqttClient()
         app = FoxessLocalCloud(
@@ -2954,3 +2952,71 @@ class InstallerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HardeningTests(unittest.TestCase):
+    def test_config_rejects_upstream_without_port(self) -> None:
+        from foxess_local_cloud.config import ConfigError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "c.json"
+            path.write_text(json.dumps({"relay": {"upstreams": {"1.2.3.4": "nohost"}}}))
+            with self.assertRaises(ConfigError):
+                load_config(path)
+
+    def test_config_rejects_bad_port_and_interval(self) -> None:
+        from foxess_local_cloud.config import ConfigError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "c.json"
+            path.write_text(json.dumps({"port": 70000, "mqtt": {"keepalive_seconds": 0}}))
+            with self.assertRaises(ConfigError) as ctx:
+                load_config(path)
+            self.assertIn("port must be 1-65535", str(ctx.exception))
+            self.assertIn("mqtt.keepalive_seconds", str(ctx.exception))
+
+    def test_example_config_is_valid(self) -> None:
+        load_config(ROOT / "local-cloud.example.json")
+
+    def test_drain_with_timeout_raises_when_peer_stalls(self) -> None:
+        import asyncio
+        from foxess_local_cloud.server import drain_with_timeout
+
+        class Stalled:
+            async def drain(self) -> None:
+                await asyncio.sleep(10)
+
+        with self.assertRaises(asyncio.TimeoutError):
+            asyncio.run(drain_with_timeout(Stalled(), timeout=0.05))  # type: ignore[arg-type]
+
+    def test_spawn_keeps_reference_and_logs_errors(self) -> None:
+        import asyncio
+
+        app = FoxessLocalCloud(AppConfig())
+        events: list[tuple[str, dict]] = []
+        app.logger.emit = lambda event, **f: events.append((event, f))  # type: ignore[method-assign]
+
+        async def boom() -> None:
+            raise RuntimeError("x")
+
+        async def run() -> None:
+            app.spawn(boom(), "boom")
+            self.assertEqual(len(app._background), 1)
+            await asyncio.sleep(0.05)
+            self.assertEqual(len(app._background), 0)
+
+        asyncio.run(run())
+        self.assertIn("background_task_error", [e for e, _ in events])
+
+
+class FrameResyncTests(unittest.TestCase):
+    def test_false_start_marker_does_not_swallow_following_frame(self) -> None:
+        from foxess_local_cloud.protocol import extract_frames, make_frame
+
+        good = make_frame(b"\x7e\x7e", b"\x01\x00\x00\x00", 0, b"\x01\x02", b"\xe7\xe7")
+        # A bogus start marker whose declared length spans into the good frame
+        # but whose end marker does not match.
+        bogus = b"\x7e\x7e\x00\x00\x00\x00\x00\x00\x08"
+        buf = bytearray(bogus + good)
+        frames = extract_frames(buf)
+        self.assertEqual([f.raw for f in frames], [good])

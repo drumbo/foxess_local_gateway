@@ -99,9 +99,13 @@ def extract_frames(buffer: bytearray) -> list[Frame]:
         if len(buffer) < total_len:
             return frames
         raw = bytes(buffer[:total_len])
-        del buffer[:total_len]
         if raw[-2:] != end:
+            # False start marker (e.g. inside another frame's payload): skip
+            # only the marker and resync, so a real frame that begins inside
+            # this bogus span is not swallowed with it.
+            del buffer[:2]
             continue
+        del buffer[:total_len]
         try:
             frames.append(parse_frame(raw))
         except ValueError:
